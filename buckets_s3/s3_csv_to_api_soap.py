@@ -11,6 +11,8 @@ import socket
 import json
 import logging
 import re
+import time
+from functools import wraps
 
 # Configuração do logger
 logger = logging.getLogger()
@@ -20,6 +22,66 @@ logger.setLevel(logging.INFO)
 s3 = boto3.client('s3')
 ses = boto3.client('ses')
 
+def validate_environment_variables(required_vars):
+    """
+    Valida se todas as variáveis de ambiente obrigatórias estão configuradas.
+
+    Args:
+        required_vars (list): Lista de nomes de variáveis obrigatórias
+
+    Raises:
+        ValueError: Se alguma variável obrigatória estiver ausente
+    """
+    missing_vars = []
+    for var in required_vars:
+        if not os.environ.get(var):
+            missing_vars.append(var)
+
+    if missing_vars:
+        error_msg = f"Variáveis de ambiente obrigatórias ausentes: {', '.join(missing_vars)}"
+        logger.error(error_msg)
+        raise ValueError(error_msg)
+
+    logger.info(f"✅ Todas as variáveis de ambiente obrigatórias estão configuradas: {', '.join(required_vars)}")
+
+def retry_on_failure(max_retries=3, initial_delay=1, backoff_factor=2):
+    """
+    Decorador para adicionar retry com backoff exponencial.
+
+    Args:
+        max_retries (int): Número máximo de tentativas
+        initial_delay (int): Delay inicial em segundos
+        backoff_factor (int): Fator de multiplicação para cada retry
+
+    Returns:
+        Decorator function
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            delay = initial_delay
+            last_exception = None
+
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    if attempt < max_retries - 1:
+                        logger.warning(
+                            f"Tentativa {attempt + 1}/{max_retries} falhou para {func.__name__}: {str(e)}. "
+                            f"Aguardando {delay}s antes de tentar novamente..."
+                        )
+                        time.sleep(delay)
+                        delay *= backoff_factor
+                    else:
+                        logger.error(f"Todas as {max_retries} tentativas falharam para {func.__name__}")
+
+            raise last_exception
+        return wrapper
+    return decorator
+
+@retry_on_failure(max_retries=3, initial_delay=1, backoff_factor=2)
 def send_notification_email(filename, result, is_error=False):
     """
     Envia um email de notificação via AWS SES com o resultado do processamento.
@@ -32,8 +94,12 @@ def send_notification_email(filename, result, is_error=False):
     try:
         # Configurações do email obtidas de variáveis de ambiente
         sender = os.environ.get('EMAIL_SENDER', 'no-reply@empresa.com.br')                                    # Email remetente (verificado no SES)
-        recipients = os.environ.get('EMAIL_RECIPIENTS', 'admin@empresa.com.br,equipe@empresa.com.br)          # Emails destinatários
-        cc = os.environ.get('EMAIL_RECIPIENTS','supervisor@empresa.com.br)                                    # Emails em cópia (opcional)
+        recipients_str = os.environ.get('EMAIL_RECIPIENTS', 'admin@empresa.com.br,equipe@empresa.com.br')     # Emails destinatários
+        cc_str = os.environ.get('EMAIL_CC', 'supervisor@empresa.com.br')                                      # Emails em cópia (opcional)
+
+        # Converter strings de emails em listas
+        recipients = [email.strip() for email in recipients_str.split(',') if email.strip()]
+        cc = [email.strip() for email in cc_str.split(',') if email.strip()]
 
         
         # Definir tipo de notificação e estilo conforme status
@@ -176,6 +242,20 @@ def lambda_handler(event, context):
     Usa formato SOAP específico com senha em base64 conforme exemplo.
     Implementado apenas com bibliotecas padrão do Python.
     """
+
+    # Validar variáveis de ambiente obrigatórias
+    try:
+        validate_environment_variables([
+            'WS_URL', 'WS_LOGIN', 'WS_PASSWORD', 'CLIENT_CODE', 'SERVICE_ID',
+            'EMAIL_SENDER', 'EMAIL_RECIPIENTS'
+        ])
+    except ValueError as e:
+        logger.error(f"Erro de configuração: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': str(e)})
+        }
+
     try:
         # Extrair informações do evento
         record = event['Records'][0]
@@ -193,11 +273,11 @@ def lambda_handler(event, context):
         file_content = response['Body'].read()
         
         # Configurações do webservice (valores reais armazenados em variáveis de ambiente)
-        ws_url=https://exemplo.donain.com.br/webservice/transmiteArquivoService   # URL do webservice SOAP
-        ws_login=usuario_webservice                                               # Login para autenticação
-        ws_password=senha_webservice                                              # Senha para autenticação
-        client_code=codigo_cliente                                                # Código do cliente no sistema
-        service_id=BNFC                                                           # ID do serviço (ex: BNFC)
+        ws_url = os.environ.get('WS_URL', 'https://exemplo.domain.com.br/webservice/transmiteArquivoService')   # URL do webservice SOAP
+        ws_login = os.environ.get('WS_LOGIN', 'usuario_webservice')                                             # Login para autenticação
+        ws_password = os.environ.get('WS_PASSWORD', 'senha_webservice')                                         # Senha para autenticação
+        client_code = os.environ.get('CLIENT_CODE', 'codigo_cliente')                                           # Código do cliente no sistema
+        service_id = os.environ.get('SERVICE_ID', 'BNFC')                                                       # ID do serviço (ex: BNFC)
         file_type = os.environ.get('FILE_TYPE', 'CSV')
         
         # Usar o nome original do arquivo (extrair somente o nome do arquivo sem o caminho)

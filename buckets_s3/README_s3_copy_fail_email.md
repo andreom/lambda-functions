@@ -17,10 +17,21 @@ Destino: s3://[YOUR-OTHER-BUCKET]/path/relatorio_vendas.csv.gz
 ## ⚙️ Configuração
 
 ### Variáveis de Ambiente
+
+#### Obrigatórias
 ```bash
-EMAIL_SOURCE=no-reply@domain.com.br      # Email remetente para notificações
+EMAIL_SOURCE=no-reply@domain.com.br      # Email remetente para notificações (deve estar verificado no SES)
 EMAIL_DESTINATION=admin@domain.com.br     # Email destinatário para alertas
 ```
+
+#### Opcionais (com valores padrão)
+```bash
+SOURCE_BUCKET=ferj-prod-snowflake-relatorio           # Bucket de origem
+DESTINATION_BUCKET=ferj-prod-integracao               # Bucket de destino
+DESTINATION_PREFIX=voxis/VIEWS_VOXIS_SAUDI_UNIMED_FERJ_SCHEMA  # Prefixo do path de destino
+```
+
+**Nota**: A função valida automaticamente as variáveis obrigatórias na inicialização. Se alguma variável obrigatória estiver ausente, a função retornará erro 500.
 
 ### Permissões IAM Necessárias
 ```json
@@ -57,12 +68,24 @@ EMAIL_DESTINATION=admin@domain.com.br     # Email destinatário para alertas
 - **Suffix**: `.csv.gz`
 - **Event Types**: `s3:ObjectCreated:*`
 
+## 🔄 Resiliência e Retry
+A função implementa retry automático com backoff exponencial para operações críticas:
+- **Envio de emails**: até 3 tentativas com delays de 1s, 2s, 4s
+- **Backoff exponencial**: reduz chances de falhas transientes
+- **Logs detalhados**: registra cada tentativa de retry
+
 ## 📧 Notificações de Email
 A Lambda envia emails automáticos em caso de erro:
 - Estrutura de path inválida
 - Arquivo de origem não encontrado
 - Falha na operação de cópia
 - Erros gerais da função
+
+Os emails incluem:
+- Timestamp do erro
+- Nome da função Lambda
+- Detalhes completos do erro
+- Informações de contexto para debugging
 
 ### Configuração do SES
 1. Verificar endereços de email no AWS SES

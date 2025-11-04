@@ -2,8 +2,10 @@ import boto3
 import logging
 import json
 import os
+import time
 from urllib.parse import unquote_plus
 from datetime import datetime
+from functools import wraps
 
 # Configurar logging
 logger = logging.getLogger()
@@ -18,6 +20,66 @@ EMAIL_SOURCE = os.environ.get('EMAIL_SOURCE', 'no-reply@domain.com.br')
 EMAIL_DESTINATION = os.environ.get('EMAIL_DESTINATION', 'admin@domain.com.br')
 EMAIL_SUBJECT_PREFIX = '[LAMBDA ERROR] Falha na cópia de arquivos S3'
 
+def validate_environment_variables(required_vars):
+    """
+    Valida se todas as variáveis de ambiente obrigatórias estão configuradas.
+
+    Args:
+        required_vars (list): Lista de nomes de variáveis obrigatórias
+
+    Raises:
+        ValueError: Se alguma variável obrigatória estiver ausente
+    """
+    missing_vars = []
+    for var in required_vars:
+        if not os.environ.get(var):
+            missing_vars.append(var)
+
+    if missing_vars:
+        error_msg = f"Variáveis de ambiente obrigatórias ausentes: {', '.join(missing_vars)}"
+        logger.error(error_msg)
+        raise ValueError(error_msg)
+
+    logger.info(f"✅ Todas as variáveis de ambiente obrigatórias estão configuradas: {', '.join(required_vars)}")
+
+def retry_on_failure(max_retries=3, initial_delay=1, backoff_factor=2):
+    """
+    Decorador para adicionar retry com backoff exponencial.
+
+    Args:
+        max_retries (int): Número máximo de tentativas
+        initial_delay (int): Delay inicial em segundos
+        backoff_factor (int): Fator de multiplicação para cada retry
+
+    Returns:
+        Decorator function
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            delay = initial_delay
+            last_exception = None
+
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    if attempt < max_retries - 1:
+                        logger.warning(
+                            f"Tentativa {attempt + 1}/{max_retries} falhou para {func.__name__}: {str(e)}. "
+                            f"Aguardando {delay}s antes de tentar novamente..."
+                        )
+                        time.sleep(delay)
+                        delay *= backoff_factor
+                    else:
+                        logger.error(f"Todas as {max_retries} tentativas falharam para {func.__name__}")
+
+            raise last_exception
+        return wrapper
+    return decorator
+
+@retry_on_failure(max_retries=3, initial_delay=1, backoff_factor=2)
 def send_error_email(error_message, context_info=None):
     """
     Envia email de notificação em caso de erro
@@ -74,14 +136,24 @@ def send_error_email(error_message, context_info=None):
 def lambda_handler(event, context):
     """
     Função Lambda para copiar arquivos CSV entre buckets
-    Trigger: Criação de arquivos .csv em s3://ferj-prod-snowflake-relatorio/voxis/
-    Destino: s3://ferj-prod-integracao/voxis/VIEWS_VOXIS_SAUDI_UNIMED_FERJ_SCHEMA/
+    Trigger: Criação de arquivos .csv em S3
     """
-    
-    # Definir buckets
-    SOURCE_BUCKET = 'ferj-prod-snowflake-relatorio'
-    DESTINATION_BUCKET = 'ferj-prod-integracao'
-    
+
+    # Validar variáveis de ambiente obrigatórias
+    try:
+        validate_environment_variables(['EMAIL_SOURCE', 'EMAIL_DESTINATION'])
+    except ValueError as e:
+        logger.error(f"Erro de configuração: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': str(e)})
+        }
+
+    # Definir buckets a partir de variáveis de ambiente
+    SOURCE_BUCKET = os.environ.get('SOURCE_BUCKET', 'ferj-prod-snowflake-relatorio')
+    DESTINATION_BUCKET = os.environ.get('DESTINATION_BUCKET', 'ferj-prod-integracao')
+    DESTINATION_PREFIX = os.environ.get('DESTINATION_PREFIX', 'voxis/VIEWS_VOXIS_SAUDI_UNIMED_FERJ_SCHEMA')
+
     # Informações do contexto para email
     context_info = {
         'function_name': context.function_name if context else 'N/A',
@@ -147,9 +219,9 @@ def lambda_handler(event, context):
             filename_without_ext = filename_with_ext.replace('.csv.gz', '').replace('.CSV.GZ', '')
             
             logger.info(f"Nome do arquivo extraído: {filename_without_ext}")
-            
+
             # Construir o path de destino
-            destination_key = f"voxis/VIEWS_VOXIS_SAUDI_UNIMED_FERJ_SCHEMA/{filename_without_ext.upper()}/{filename_with_ext}"
+            destination_key = f"{DESTINATION_PREFIX}/{filename_without_ext.upper()}/{filename_with_ext}"
             
             logger.info(f"Path de origem: s3://{source_bucket}/{object_key}")
             logger.info(f"Path de destino: s3://{DESTINATION_BUCKET}/{destination_key}")

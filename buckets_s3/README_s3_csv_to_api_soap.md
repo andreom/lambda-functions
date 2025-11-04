@@ -14,6 +14,8 @@ A função monitora um bucket S3, processa arquivos CSV quando são criados e en
 
 ### Variáveis de Ambiente Obrigatórias
 
+**Nota**: A função valida automaticamente as variáveis obrigatórias na inicialização. Se alguma estiver ausente, a função retornará erro 500 com mensagem detalhada.
+
 #### Webservice SAUDI/VOXIS
 ```bash
 WS_URL=https://exemplo.domain.com.br/webservice/transmiteArquivoService    # URL do webservice SOAP
@@ -84,6 +86,13 @@ ERROR_PATH=erros/                                                        # Pasta
     ]
 }
 ```
+
+## 🔄 Resiliência e Retry
+A função implementa retry automático com backoff exponencial para operações críticas:
+- **Envio de emails**: até 3 tentativas com delays de 1s, 2s, 4s
+- **Backoff exponencial**: reduz chances de falhas transientes
+- **Logs detalhados**: registra cada tentativa de retry
+- **Parse de resposta**: dupla estratégia (XML + regex) para máxima confiabilidade
 
 ## 📧 Configuração do SES
 1. **Verificar emails no AWS SES**:
