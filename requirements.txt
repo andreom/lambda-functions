@@ -1,0 +1,10 @@
+# AWS Lambda Python Dependencies
+# Python Runtime: 3.11 or higher recommended
+
+# AWS SDK for Python
+# Note: boto3 is already included in AWS Lambda runtime by default
+# but it's good practice to specify the version for local development
+boto3>=1.28.0
+
+# If deploying to Lambda, boto3 can be omitted from the deployment package
+# as it's provided by the Lambda execution environment

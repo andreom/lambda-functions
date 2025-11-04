@@ -1,0 +1,219 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  AWS Lambda Functions for S3 automation and SOAP integration
+
+# Global configuration for all functions
+Globals:
+  Function:
+    Timeout: 600
+    MemorySize: 512
+    Runtime: python3.11
+    Architectures:
+      - x86_64
+
+Parameters:
+  # S3 Copy Function Parameters
+  SourceBucket:
+    Type: String
+    Description: Source S3 bucket for file copy
+    Default: ferj-prod-snowflake-relatorio
+
+  DestinationBucket:
+    Type: String
+    Description: Destination S3 bucket for file copy
+    Default: ferj-prod-integracao
+
+  DestinationPrefix:
+    Type: String
+    Description: Destination path prefix
+    Default: voxis/VIEWS_VOXIS_SAUDI_UNIMED_FERJ_SCHEMA
+
+  EmailSource:
+    Type: String
+    Description: Source email for notifications (must be verified in SES)
+    Default: no-reply@domain.com.br
+
+  EmailDestination:
+    Type: String
+    Description: Destination email for error notifications
+    Default: admin@domain.com.br
+
+  # SOAP Function Parameters
+  WebserviceUrl:
+    Type: String
+    Description: SOAP webservice URL
+    Default: https://exemplo.domain.com.br/webservice/transmiteArquivoService
+
+  WebserviceLogin:
+    Type: String
+    Description: Webservice login username
+    NoEcho: true
+
+  WebservicePassword:
+    Type: String
+    Description: Webservice password
+    NoEcho: true
+
+  ClientCode:
+    Type: String
+    Description: Client code for webservice
+    NoEcho: true
+
+  ServiceId:
+    Type: String
+    Description: Service ID
+    Default: BNFC
+
+  EmailSender:
+    Type: String
+    Description: Email sender for SOAP notifications (must be verified in SES)
+    Default: no-reply@empresa.com.br
+
+  EmailRecipients:
+    Type: String
+    Description: Email recipients (comma-separated)
+    Default: admin@empresa.com.br,equipe@empresa.com.br
+
+Resources:
+  # ============================================
+  # S3 Copy with Email Notification Function
+  # ============================================
+  S3CopyFailEmailFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: s3-copy-fail-email
+      CodeUri: buckets_s3/
+      Handler: s3_copy_fail_email.lambda_handler
+      Description: Copy files between S3 buckets with email notification on failure
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Ref SourceBucket
+          DESTINATION_BUCKET: !Ref DestinationBucket
+          DESTINATION_PREFIX: !Ref DestinationPrefix
+          EMAIL_SOURCE: !Ref EmailSource
+          EMAIL_DESTINATION: !Ref EmailDestination
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref SourceBucket
+        - S3CrudPolicy:
+            BucketName: !Ref DestinationBucket
+        - SESCrudPolicy:
+            IdentityName: !Ref EmailSource
+      Events:
+        S3Event:
+          Type: S3
+          Properties:
+            Bucket: !Ref SourceS3Bucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: voxis/
+                  - Name: suffix
+                    Value: .csv.gz
+
+  # Source S3 Bucket
+  SourceS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref SourceBucket
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt S3CopyFailEmailFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: voxis/
+                  - Name: suffix
+                    Value: .csv.gz
+
+  # Permission for S3 to invoke Lambda
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref S3CopyFailEmailFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:aws:s3:::${SourceBucket}'
+
+  # ============================================
+  # CSV to SOAP Webservice Function
+  # ============================================
+  CsvToSoapFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: csv-to-soap-integration
+      CodeUri: buckets_s3/
+      Handler: s3_csv_to_api_soap.lambda_handler
+      Description: Process CSV files from S3 and send to SOAP webservice
+      Timeout: 600
+      Environment:
+        Variables:
+          WS_URL: !Ref WebserviceUrl
+          WS_LOGIN: !Ref WebserviceLogin
+          WS_PASSWORD: !Ref WebservicePassword
+          CLIENT_CODE: !Ref ClientCode
+          SERVICE_ID: !Ref ServiceId
+          FILE_TYPE: CSV
+          EMAIL_SENDER: !Ref EmailSender
+          EMAIL_RECIPIENTS: !Ref EmailRecipients
+          EMAIL_CC: ''
+          MOVE_PROCESSED: 'true'
+          PROCESSED_PATH: processados/
+          DELETE_ORIGINAL: 'true'
+          MOVE_FAILED: 'true'
+          ERROR_PATH: erros/
+          VERIFY_SSL: '1'
+          WS_TIMEOUT: '550'
+      Policies:
+        - S3CrudPolicy:
+            BucketName: '*'
+        - SESCrudPolicy:
+            IdentityName: !Ref EmailSender
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: '*'
+
+  # ============================================
+  # CloudWatch Log Groups
+  # ============================================
+  S3CopyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${S3CopyFailEmailFunction}'
+      RetentionInDays: 30
+
+  SoapIntegrationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${CsvToSoapFunction}'
+      RetentionInDays: 30
+
+Outputs:
+  S3CopyFailEmailFunction:
+    Description: S3 Copy Fail Email Lambda Function ARN
+    Value: !GetAtt S3CopyFailEmailFunction.Arn
+    Export:
+      Name: S3CopyFailEmailFunctionArn
+
+  CsvToSoapFunction:
+    Description: CSV to SOAP Integration Lambda Function ARN
+    Value: !GetAtt CsvToSoapFunction.Arn
+    Export:
+      Name: CsvToSoapFunctionArn
+
+  S3CopyLogGroup:
+    Description: CloudWatch Log Group for S3 Copy Function
+    Value: !Ref S3CopyLogGroup
+
+  SoapIntegrationLogGroup:
+    Description: CloudWatch Log Group for SOAP Integration Function
+    Value: !Ref SoapIntegrationLogGroup
