@@ -40,7 +40,24 @@ def validate_environment_variables(required_vars):
         logger.error(error_msg)
         raise ValueError(error_msg)
 
-    logger.info(f"✅ Todas as variáveis de ambiente obrigatórias estão configuradas: {', '.join(required_vars)}")
+    logger.info(f"[SUCCESS] All required environment variables are configured: {', '.join(required_vars)}")
+
+def validate_email_format(email):
+    """
+    Valida formato de endereço de email.
+
+    Args:
+        email (str): Endereço de email para validar
+
+    Returns:
+        bool: True se o email é válido, False caso contrário
+    """
+    import re
+    EMAIL_REGEX = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
+    if not email or not EMAIL_REGEX.match(email):
+        logger.error(f"Invalid email format: {email}")
+        return False
+    return True
 
 def retry_on_failure(max_retries=3, initial_delay=1, backoff_factor=2):
     """
@@ -124,11 +141,11 @@ def send_error_email(error_message, context_info=None):
             }
         )
         
-        logger.info(f"✅ Email de erro enviado com sucesso. MessageId: {response['MessageId']}")
+        logger.info(f"[SUCCESS] Email de erro enviado com sucesso. MessageId: {response['MessageId']}")
         return True
         
     except Exception as email_error:
-        logger.error(f"❌ Falha ao enviar email de notificação: {str(email_error)}")
+        logger.error(f"[ERROR] Falha ao enviar email de notificação: {str(email_error)}")
         logger.error(f"   Email origem: {EMAIL_SOURCE}")
         logger.error(f"   Email destino: {EMAIL_DESTINATION}")
         return False
@@ -163,11 +180,24 @@ def lambda_handler(event, context):
         'destination_bucket': DESTINATION_BUCKET
     }
     
-    logger.info(f"Iniciando execução da Lambda. Event: {json.dumps(event)}")
+    # Validar estrutura do evento
+    if 'Records' not in event or not event['Records']:
+        logger.warning("No Records found in S3 event")
+        return {
+            'statusCode': 200,
+            'body': json.dumps({'message': 'No records to process'})
+        }
+
+    logger.info(f"Iniciando execução da Lambda com {len(event['Records'])} record(s)")
     logger.info(f"Bucket origem: {SOURCE_BUCKET}")
     logger.info(f"Bucket destino: {DESTINATION_BUCKET}")
-    logger.info(f"Email configurado - Origem: {EMAIL_SOURCE}, Destino: {EMAIL_DESTINATION}")
-    
+    logger.debug(f"Email configurado - Origem: {EMAIL_SOURCE}, Destino: {EMAIL_DESTINATION}")
+
+    # Tracking de arquivos processados
+    processed_count = 0
+    skipped_count = 0
+    error_count = 0
+
     try:
         # Processar cada registro do evento S3
         for record in event['Records']:
@@ -257,17 +287,17 @@ def lambda_handler(event, context):
                     Key=destination_key
                 )
                 
-                logger.info(f"✅ Arquivo copiado com sucesso!")
+                logger.info(f"[SUCCESS] Arquivo copiado com sucesso!")
                 logger.info(f"   Origem: s3://{source_bucket}/{object_key}")
                 logger.info(f"   Destino: s3://{DESTINATION_BUCKET}/{destination_key}")
                 
                 # Verificar se a cópia foi bem-sucedida
                 s3_client.head_object(Bucket=DESTINATION_BUCKET, Key=destination_key)
-                logger.info(f"✅ Cópia verificada no destino")
+                logger.info(f"[SUCCESS] Cópia verificada no destino")
                 
             except Exception as e:
                 error_msg = f"Erro ao copiar arquivo: {str(e)}"
-                logger.error(f"❌ {error_msg}")
+                logger.error(f"[ERROR] {error_msg}")
                 logger.error(f"   Origem: s3://{source_bucket}/{object_key}")
                 logger.error(f"   Destino: s3://{DESTINATION_BUCKET}/{destination_key}")
                 
@@ -285,7 +315,7 @@ def lambda_handler(event, context):
     
     except Exception as e:
         error_msg = f"Erro geral na execução da Lambda: {str(e)}"
-        logger.error(f"❌ {error_msg}")
+        logger.error(f"[ERROR] {error_msg}")
         logger.error(f"Event completo: {json.dumps(event)}")
         
         # Enviar email de notificação para erro geral
@@ -298,7 +328,7 @@ def lambda_handler(event, context):
         
         raise
     
-    logger.info("🏁 Execução da Lambda finalizada com sucesso")
+    logger.info("[COMPLETED] Execução da Lambda finalizada com sucesso")
     
     return {
         'statusCode': 200,

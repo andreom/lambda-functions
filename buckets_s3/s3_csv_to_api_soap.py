@@ -7,7 +7,6 @@ import os
 import datetime
 import xml.etree.ElementTree as ET
 import ssl
-import socket
 import json
 import logging
 import re
@@ -19,8 +18,11 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # Clientes AWS inicializados fora do handler para reutilização
-s3 = boto3.client('s3')
-ses = boto3.client('ses')
+s3_client = boto3.client('s3')
+ses_client = boto3.client('ses')
+
+# Regex para validação de email
+EMAIL_REGEX = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
 
 def validate_environment_variables(required_vars):
     """
@@ -42,7 +44,22 @@ def validate_environment_variables(required_vars):
         logger.error(error_msg)
         raise ValueError(error_msg)
 
-    logger.info(f"✅ Todas as variáveis de ambiente obrigatórias estão configuradas: {', '.join(required_vars)}")
+    logger.info(f"[SUCCESS] All required environment variables are configured: {', '.join(required_vars)}")
+
+def validate_email_format(email):
+    """
+    Valida formato de endereço de email.
+
+    Args:
+        email (str): Endereço de email para validar
+
+    Returns:
+        bool: True se o email é válido, False caso contrário
+    """
+    if not email or not EMAIL_REGEX.match(email):
+        logger.error(f"Invalid email format: {email}")
+        return False
+    return True
 
 def retry_on_failure(max_retries=3, initial_delay=1, backoff_factor=2):
     """
@@ -81,7 +98,44 @@ def retry_on_failure(max_retries=3, initial_delay=1, backoff_factor=2):
         return wrapper
     return decorator
 
-@retry_on_failure(max_retries=3, initial_delay=1, backoff_factor=2)
+def extract_response_data(response_text):
+    """
+    Extrai dados estruturados de uma resposta SOAP usando regex.
+    Patterns são case-sensitive e seguem o formato da API SAUDI/VOXIS.
+
+    Args:
+        response_text (str): Texto da resposta SOAP para processar
+
+    Returns:
+        dict: Dicionário com dados extraídos incluindo status, protocolo, estatísticas
+    """
+    # Padrões regex para extrair informações específicas da resposta SAUDI API
+    # NOTA: Estes padrões são específicos para o formato da resposta SAUDI/VOXIS
+    # Atualize se o formato da API mudar
+    success_match = re.search(r'Arquivo inserido com sucesso!', response_text)
+    error_match = re.search(r'Arquivo inserido, mas com erros', response_text)
+    protocolo_match = re.search(r'Número do protocolo\s*:\s*(\d+)', response_text)
+    total_registros_match = re.search(r'Qtd\. Total de Registros\s*:\s*(\d+)', response_text)
+    linhas_aceitas_match = re.search(r'Qtd\. Linhas Aceitas\s*:\s*(\d+)', response_text)
+    linhas_rejeitadas_match = re.search(r'Qtd\. Linhas Rejeitadas\s*:\s*(\d+)', response_text)
+
+    # Verificar se a resposta indica erro
+    has_error = error_match is not None
+    status_message = error_match.group(0) if error_match else (success_match.group(0) if success_match else 'Arquivo processado')
+
+    # Construir objeto de resposta estruturado
+    return {
+        'status': 'Erro' if has_error else 'Sucesso',
+        'mensagem': status_message,
+        'protocolo': protocolo_match.group(1) if protocolo_match else 'N/A',
+        'total_registros': total_registros_match.group(1) if total_registros_match else '0',
+        'linhas_aceitas': linhas_aceitas_match.group(1) if linhas_aceitas_match else '0',
+        'linhas_rejeitadas': linhas_rejeitadas_match.group(1) if linhas_rejeitadas_match else '0',
+        'resposta_completa': response_text[:500] if len(response_text) > 500 else response_text,
+        'has_error': has_error
+    }
+
+@retry_on_failure(max_retries=3, initial_delay=0.5, backoff_factor=1.5)
 def send_notification_email(filename, result, is_error=False):
     """
     Envia um email de notificação via AWS SES com o resultado do processamento.
@@ -197,7 +251,7 @@ def send_notification_email(filename, result, is_error=False):
         """
         
         # Envia o email usando o AWS SES
-        response = ses.send_email(
+        response = ses_client.send_email(
             Source=sender,
             Destination={
                 'ToAddresses': recipients,
@@ -256,6 +310,14 @@ def lambda_handler(event, context):
             'body': json.dumps({'error': str(e)})
         }
 
+    # Validar estrutura do evento
+    if 'Records' not in event or not event['Records']:
+        logger.warning("No Records found in S3 event")
+        return {
+            'statusCode': 400,
+            'body': json.dumps({'error': 'No S3 records to process'})
+        }
+
     try:
         # Extrair informações do evento
         record = event['Records'][0]
@@ -263,13 +325,25 @@ def lambda_handler(event, context):
         key = urllib.parse.unquote_plus(record['s3']['object']['key'])
 
         logger.info(f"Iniciando processamento do arquivo: {key} do bucket: {bucket}")
-        
+
         # Verificação rápida se é um arquivo CSV
         if not key.lower().endswith('.csv'):
             return {'statusCode': 200, 'body': 'Arquivo ignorado: não é CSV'}
-        
+
+        # Verificar tamanho do arquivo antes de ler
+        head = s3_client.head_object(Bucket=bucket, Key=key)
+        file_size = head['ContentLength']
+        max_size = 100 * 1024 * 1024  # 100MB limit
+        if file_size > max_size:
+            error_msg = f"File too large: {file_size} bytes (max: {max_size})"
+            logger.error(error_msg)
+            return {
+                'statusCode': 413,
+                'body': json.dumps({'error': error_msg, 'file_size': file_size, 'max_size': max_size})
+            }
+
         # Obter o arquivo do S3
-        response = s3.get_object(Bucket=bucket, Key=key)
+        response = s3_client.get_object(Bucket=bucket, Key=key)
         file_content = response['Body'].read()
         
         # Configurações do webservice (valores reais armazenados em variáveis de ambiente)
@@ -315,11 +389,12 @@ def lambda_handler(event, context):
         # Definir contexto SSL
         ssl_context = ssl.create_default_context()
         if os.environ.get('VERIFY_SSL', '1') == '0':
+            logger.critical("[SECURITY WARNING] SSL VERIFICATION DISABLED - Man-in-the-middle attack risk!")
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl.CERT_NONE
-        
-        # Configurar timeout - Aumentado para 10 minutos (600 segundos)
-        timeout = int(os.environ.get('WS_TIMEOUT', '550'))
+
+        # Configurar timeout - Reduzido para 300s (5 min) deixando buffer para Lambda cleanup
+        timeout = int(os.environ.get('WS_TIMEOUT', '300'))
         
         # Criar conexão HTTP/HTTPS
         if url_parts.scheme == 'https':
@@ -426,6 +501,7 @@ def lambda_handler(event, context):
                 result = {
                     'status': 'Erro de processamento',
                     'mensagem': f"Erro ao processar resposta XML: {str(xml_error)}",
+                    'protocolo': 'N/A',
                     'resposta_completa': response_data[:500]
                 }
                 # Enviar email de erro para problemas no processamento do XML
@@ -433,17 +509,22 @@ def lambda_handler(event, context):
             
             # Em caso de sucesso, opcionalmente move o arquivo para pasta de processados
             if os.environ.get('MOVE_PROCESSED') == 'true':
-                processed_path = os.environ.get('PROCESSED_PATH', 'processados/')
-                processed_key = processed_path + key.split('/')[-1]
-                
-                s3.copy_object(
-                    Bucket=bucket,
-                    CopySource={'Bucket': bucket, 'Key': key},
-                    Key=processed_key
-                )
-                
-                if os.environ.get('DELETE_ORIGINAL') == 'true':
-                    s3.delete_object(Bucket=bucket, Key=key)
+                try:
+                    processed_path = os.environ.get('PROCESSED_PATH', 'processados/')
+                    processed_key = processed_path + key.split('/')[-1]
+
+                    s3_client.copy_object(
+                        Bucket=bucket,
+                        CopySource={'Bucket': bucket, 'Key': key},
+                        Key=processed_key
+                    )
+
+                    if os.environ.get('DELETE_ORIGINAL') == 'true':
+                        s3_client.delete_object(Bucket=bucket, Key=key)
+
+                    logger.info(f"File moved to {processed_key}")
+                except Exception as move_error:
+                    logger.error(f"Failed to move processed file: {str(move_error)}")
             
             return {
                 'statusCode': 200,
@@ -479,14 +560,18 @@ def lambda_handler(event, context):
             
             # Em caso de erro, opcionalmente move o arquivo para pasta de erros
             if os.environ.get('MOVE_FAILED') == 'true':
-                error_path = os.environ.get('ERROR_PATH', 'erros/')
-                error_key = error_path + key.split('/')[-1]
-                
-                s3.copy_object(
-                    Bucket=bucket,
-                    CopySource={'Bucket': bucket, 'Key': key},
-                    Key=error_key
-                )
+                try:
+                    error_path = os.environ.get('ERROR_PATH', 'erros/')
+                    error_key = error_path + key.split('/')[-1]
+
+                    s3_client.copy_object(
+                        Bucket=bucket,
+                        CopySource={'Bucket': bucket, 'Key': key},
+                        Key=error_key
+                    )
+                    logger.info(f"Failed file moved to {error_key}")
+                except Exception as move_error:
+                    logger.error(f"Failed to move failed file: {str(move_error)}")
             
             return {
                 'statusCode': 500,
@@ -507,8 +592,8 @@ def lambda_handler(event, context):
             # Usa o nome do arquivo do evento, se disponível
             filename = event['Records'][0]['s3']['object']['key'] if 'Records' in event and len(event['Records']) > 0 else 'unknown_file'
             send_notification_email(filename, error_result, is_error=True)
-        except:
-            logger.error("Não foi possível enviar email de notificação para o erro geral")
+        except Exception as email_error:
+            logger.error(f"Não foi possível enviar email de notificação para o erro geral: {str(email_error)}")
         
         return {
             'statusCode': 500, 
