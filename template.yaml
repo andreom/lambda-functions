@@ -79,6 +79,13 @@ Resources:
   # ============================================
   # S3 Copy with Email Notification Function
   # ============================================
+  # Dead Letter Queue for failed invocations
+  S3CopyDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: s3-copy-fail-email-dlq
+      MessageRetentionPeriod: 1209600  # 14 days
+
   S3CopyFailEmailFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -86,6 +93,10 @@ Resources:
       CodeUri: buckets_s3/
       Handler: s3_copy_fail_email.lambda_handler
       Description: Copy files between S3 buckets with email notification on failure
+      ReservedConcurrentExecutions: 10  # Limit concurrent executions
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt S3CopyDLQ.Arn
       Environment:
         Variables:
           SOURCE_BUCKET: !Ref SourceBucket
@@ -100,19 +111,8 @@ Resources:
             BucketName: !Ref DestinationBucket
         - SESCrudPolicy:
             IdentityName: !Ref EmailSource
-      Events:
-        S3Event:
-          Type: S3
-          Properties:
-            Bucket: !Ref SourceS3Bucket
-            Events: s3:ObjectCreated:*
-            Filter:
-              S3Key:
-                Rules:
-                  - Name: prefix
-                    Value: voxis/
-                  - Name: suffix
-                    Value: .csv.gz
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt S3CopyDLQ.QueueName
 
   # Source S3 Bucket
   SourceS3Bucket:
@@ -143,6 +143,13 @@ Resources:
   # ============================================
   # CSV to SOAP Webservice Function
   # ============================================
+  # Dead Letter Queue for SOAP function
+  SoapIntegrationDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: csv-to-soap-integration-dlq
+      MessageRetentionPeriod: 1209600  # 14 days
+
   CsvToSoapFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -150,7 +157,10 @@ Resources:
       CodeUri: buckets_s3/
       Handler: s3_csv_to_api_soap.lambda_handler
       Description: Process CSV files from S3 and send to SOAP webservice
-      Timeout: 600
+      ReservedConcurrentExecutions: 5  # Limit concurrent executions to avoid overwhelming SOAP service
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt SoapIntegrationDLQ.Arn
       Environment:
         Variables:
           WS_URL: !Ref WebserviceUrl
@@ -168,12 +178,16 @@ Resources:
           MOVE_FAILED: 'true'
           ERROR_PATH: erros/
           VERIFY_SSL: '1'
-          WS_TIMEOUT: '550'
+          WS_TIMEOUT: '300'  # Reduced from 550s to 300s (5 min) leaving buffer for Lambda cleanup
       Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref SourceBucket
         - S3CrudPolicy:
-            BucketName: '*'
+            BucketName: !Ref DestinationBucket
         - SESCrudPolicy:
             IdentityName: !Ref EmailSender
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt SoapIntegrationDLQ.QueueName
         - Statement:
             - Effect: Allow
               Action:
@@ -196,6 +210,73 @@ Resources:
     Properties:
       LogGroupName: !Sub '/aws/lambda/${CsvToSoapFunction}'
       RetentionInDays: 30
+
+  # ============================================
+  # CloudWatch Alarms
+  # ============================================
+  S3CopyErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: s3-copy-fail-email-errors
+      AlarmDescription: Alert when S3 copy function has errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300  # 5 minutes
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref S3CopyFailEmailFunction
+
+  S3CopyThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: s3-copy-fail-email-throttles
+      AlarmDescription: Alert when S3 copy function is throttled
+      MetricName: Throttles
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref S3CopyFailEmailFunction
+
+  SoapIntegrationErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: csv-to-soap-integration-errors
+      AlarmDescription: Alert when SOAP integration function has errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CsvToSoapFunction
+
+  SoapIntegrationDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: csv-to-soap-integration-duration
+      AlarmDescription: Alert when SOAP integration duration is too high (near timeout)
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 500000  # 500 seconds (close to 600s timeout)
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CsvToSoapFunction
 
 Outputs:
   S3CopyFailEmailFunction:
